@@ -1,0 +1,6 @@
+invoice_id,company,customer,amount,due_date,status,contact_email
+INV001,ABC Pvt Ltd,Accounts Team,25000,2026-08-20,overdue,accounts@abc.example
+INV002,XYZ Industries,Finance Team,48000,2026-08-28,overdue,finance@xyz.example
+INV003,LMN Retail,Payments Team,15000,2026-09-10,open,payments@lmn.example
+INV004,PQR Solutions,Accounts Team,32000,2026-08-15,paid,accounts@pqr.example
+INV005,Delta Technologies,Finance Team,76000,2026-07-15,overdue,finance@delta.example

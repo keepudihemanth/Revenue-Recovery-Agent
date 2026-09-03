@@ -1,0 +1,11 @@
+payment_id,customer,amount,status,failure_reason,attempts
+pay_001,Customer A,1500,failed,temporary_failure,0
+pay_002,Customer B,2500,failed,insufficient_funds,0
+pay_003,Customer C,1000,recovered,,0
+pay_004,Customer D,3000,failed,temporary_failure,1
+pay_005,Customer E,2000,failed,checkout_abandoned,0
+pay_006,Customer F,5000,recovered,,0
+pay_007,Customer G,1200,failed,temporary_failure,0
+pay_008,Customer H,1800,failed,insufficient_funds,0
+pay_009,Customer I,2200,failed,checkout_abandoned,0
+pay_010,Customer J,3500,recovered,,0
