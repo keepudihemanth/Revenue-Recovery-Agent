@@ -31,7 +31,8 @@ function getStatusClass(status) {
     normalizedStatus.includes("executed") ||
     normalizedStatus.includes("promise") ||
     normalizedStatus.includes("paid") ||
-    normalizedStatus.includes("captured")
+    normalizedStatus.includes("captured") ||
+    normalizedStatus.includes("success")
   ) {
     return "status-badge status-success";
   }
@@ -46,7 +47,8 @@ function getStatusClass(status) {
 
   if (
     normalizedStatus.includes("failed") ||
-    normalizedStatus.includes("cancel")
+    normalizedStatus.includes("cancel") ||
+    normalizedStatus.includes("expired")
   ) {
     return "status-badge status-danger";
   }
@@ -78,6 +80,9 @@ function App() {
   const [pollingPayment, setPollingPayment] = useState(null);
   const pollingRef = useRef(null);
 
+  /*
+   * Generic API helper.
+   */
   async function fetchJson(endpoint, options = {}) {
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
       ...options,
@@ -95,13 +100,18 @@ function App() {
 
     if (!response.ok || data.success === false) {
       throw new Error(
-        data.message || `Request failed with status ${response.status}`
+        data.message ||
+          data.error ||
+          `Request failed with status ${response.status}`
       );
     }
 
     return data;
   }
 
+  /*
+   * Load payment-recovery records.
+   */
   const loadPayments = useCallback(async () => {
     const data = await fetchJson("/api/recovery");
 
@@ -113,6 +123,12 @@ function App() {
     );
   }, []);
 
+  /*
+   * Load dashboard summary.
+   *
+   * The backend currently returns the values both at the root
+   * and inside the summary object, so both formats are supported.
+   */
   const loadSummary = useCallback(async () => {
     const data = await fetchJson("/api/summary");
 
@@ -151,6 +167,12 @@ function App() {
     });
   }, []);
 
+  /*
+   * Load receivables.
+   *
+   * This remains optional because some backend versions
+   * may not expose this endpoint.
+   */
   const loadReceivables = useCallback(async () => {
     try {
       const data = await fetchJson("/api/receivables");
@@ -162,13 +184,18 @@ function App() {
           []
       );
     } catch (requestError) {
-      // Keep the dashboard usable if the receivables endpoint
-      // is not available in the current backend version.
-      console.warn("Receivables could not be loaded:", requestError);
+      console.warn(
+        "Receivables could not be loaded:",
+        requestError
+      );
+
       setReceivables([]);
     }
   }, []);
 
+  /*
+   * Load audit records.
+   */
   const loadAuditRecords = useCallback(async () => {
     const data = await fetchJson("/api/audit");
 
@@ -179,6 +206,9 @@ function App() {
     );
   }, []);
 
+  /*
+   * Refresh every dashboard section.
+   */
   const refreshAllData = useCallback(async () => {
     try {
       setLoading(true);
@@ -191,7 +221,11 @@ function App() {
         loadAuditRecords(),
       ]);
     } catch (requestError) {
-      console.error("Dashboard refresh failed:", requestError);
+      console.error(
+        "Dashboard refresh failed:",
+        requestError
+      );
+
       setError(requestError.message);
     } finally {
       setLoading(false);
@@ -203,27 +237,40 @@ function App() {
     loadAuditRecords,
   ]);
 
+  /*
+   * Initial dashboard load.
+   */
   useEffect(() => {
     refreshAllData();
   }, [refreshAllData]);
 
+  /*
+   * Refresh when the browser window receives focus.
+   */
   useEffect(() => {
     const handleWindowFocus = () => {
       refreshAllData();
     };
 
-    window.addEventListener("focus", handleWindowFocus);
+    window.addEventListener(
+      "focus",
+      handleWindowFocus
+    );
 
     return () => {
-      window.removeEventListener("focus", handleWindowFocus);
+      window.removeEventListener(
+        "focus",
+        handleWindowFocus
+      );
     };
   }, [refreshAllData]);
 
   /*
-   * Poll Razorpay payment status after opening the payment link.
+   * Poll Razorpay payment-link status after opening
+   * a payment link.
    *
-   * The backend status endpoint must update the CSV files when
-   * Razorpay returns paid/recovered.
+   * The backend endpoint should update payments.csv
+   * and audit_log.csv when the payment is successful.
    */
   useEffect(() => {
     if (!pollingPayment) {
@@ -235,26 +282,34 @@ function App() {
     const checkPaymentStatus = async () => {
       try {
         const response = await fetchJson(
-          `/api/recovery/status/${pollingPayment.paymentLinkId}`
+          `/api/payment-links/${pollingPayment.paymentLinkId}/sync`,
+          {
+            method: "POST",
+          }
         );
 
         const status = String(
-          response.status ||
-            response.recovery_status ||
-            response.razorpay_status ||
+          response.razorpay_status ||
             response.audit_status ||
+            response.recovery_status ||
+            response.status ||
             ""
         ).toLowerCase();
 
         const isRecovered =
-          status === "recovered" ||
-          status === "paid" ||
-          status === "captured" ||
-          response.updated === true;
+          response.success === true &&
+          (
+            status === "recovered" ||
+            status === "paid" ||
+            status === "captured" ||
+            status === "successful" ||
+            status === "success" ||
+            response.updated === true
+          );
 
         if (isRecovered && !cancelled) {
           setMessage(
-            "Payment confirmed successfully. Dashboard updated."
+            `Payment ${pollingPayment.paymentId} recovered successfully.`
           );
 
           setPollingPayment(null);
@@ -264,9 +319,17 @@ function App() {
             pollingRef.current = null;
           }
 
+          /*
+           * Reload the payment table, summary cards,
+           * receivables, and audit log.
+           */
           await refreshAllData();
         }
       } catch (requestError) {
+        /*
+         * Do not stop polling for a temporary request error.
+         * The next polling attempt will try again.
+         */
         console.error(
           "Payment status check failed:",
           requestError
@@ -274,8 +337,10 @@ function App() {
       }
     };
 
+    // Check immediately instead of waiting five seconds.
     checkPaymentStatus();
 
+    // Continue checking every five seconds.
     pollingRef.current = setInterval(
       checkPaymentStatus,
       5000
@@ -291,6 +356,9 @@ function App() {
     };
   }, [pollingPayment, refreshAllData]);
 
+  /*
+   * Execute a receivables action.
+   */
   async function handleExecuteAction(invoiceId) {
     try {
       setLoading(true);
@@ -317,6 +385,9 @@ function App() {
     }
   }
 
+  /*
+   * Record a promise to pay.
+   */
   async function handlePromiseToPay(invoiceId) {
     try {
       setLoading(true);
@@ -343,6 +414,60 @@ function App() {
     }
   }
 
+  /*
+   * Reset demo data.
+   */
+  async function handleResetDemo() {
+    const confirmed = window.confirm(
+      "Reset the demo data? This will clear recovery updates and audit records."
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setMessage("");
+      setError("");
+
+      const result = await fetchJson(
+        "/api/demo/reset",
+        {
+          method: "POST",
+        }
+      );
+
+      if (!result.success) {
+        throw new Error(
+          result.error ||
+            "Failed to reset demo data"
+        );
+      }
+
+      await refreshAllData();
+
+      setMessage(
+        "Demo data reset successfully."
+      );
+    } catch (requestError) {
+      console.error(
+        "Reset demo error:",
+        requestError
+      );
+
+      setError(
+        requestError.message ||
+          "Unable to reset demo data"
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  /*
+   * Create a Razorpay recovery payment link.
+   */
   async function handleRecoverPayment(payment) {
     const paymentId = payment.payment_id;
 
@@ -375,12 +500,23 @@ function App() {
         );
       }
 
-      window.open(paymentLink, "_blank");
+      /*
+       * Open the Razorpay checkout/payment page.
+       */
+      window.open(
+        paymentLink,
+        "_blank",
+        "noopener,noreferrer"
+      );
 
       setMessage(
         "Payment link opened. Waiting for payment confirmation..."
       );
 
+      /*
+       * Start automatic polling when the backend
+       * returns a payment-link ID.
+       */
       if (paymentLinkId) {
         setPollingPayment({
           paymentId,
@@ -388,20 +524,30 @@ function App() {
         });
       } else {
         setMessage(
-          "Payment link opened. Payment link ID was not returned, so automatic status checking is unavailable."
+          "Payment link opened, but automatic status checking is unavailable."
         );
       }
 
-      // Refresh immediately to show the newly created link.
+      /*
+       * Refresh immediately to show the newly created
+       * payment link or updated recovery record.
+       */
       await refreshAllData();
     } catch (requestError) {
-      console.error("Payment recovery failed:", requestError);
+      console.error(
+        "Payment recovery failed:",
+        requestError
+      );
+
       setError(requestError.message);
     } finally {
       setLoading(false);
     }
   }
 
+  /*
+   * Determine whether a payment is recovered.
+   */
   function isRecovered(payment) {
     const status = String(
       payment.recovery_status ||
@@ -412,7 +558,9 @@ function App() {
     return (
       status === "recovered" ||
       status === "paid" ||
-      status === "captured"
+      status === "captured" ||
+      status === "successful" ||
+    status === "success"
     );
   }
 
@@ -421,19 +569,29 @@ function App() {
       <header className="app-header">
         <div>
           <h1>Revenue Recovery Dashboard</h1>
+
           <p>
             Monitor payments, receivables, recovery actions,
             and audit activity.
           </p>
         </div>
 
-        <button
-          className="refresh-button"
-          onClick={refreshAllData}
-          disabled={loading}
-        >
-          {loading ? "Refreshing..." : "Refresh"}
-        </button>
+        <div className="header-actions">
+          <button
+            onClick={handleResetDemo}
+            disabled={loading}
+          >
+            Reset Demo
+          </button>
+
+          <button
+            className="refresh-button"
+            onClick={refreshAllData}
+            disabled={loading}
+          >
+            {loading ? "Refreshing..." : "Refresh"}
+          </button>
+        </div>
       </header>
 
       {message && (
@@ -476,6 +634,16 @@ function App() {
 
           <strong className="text-warning">
             {formatCurrency(summary.pending_amount)}
+          </strong>
+        </div>
+
+        <div className="summary-card">
+          <span className="summary-label">
+            Recoverable amount
+          </span>
+
+          <strong>
+            {formatCurrency(summary.recoverable_amount)}
           </strong>
         </div>
 
@@ -541,6 +709,7 @@ function App() {
           <div className="section-heading">
             <div>
               <h2>Payment recovery</h2>
+
               <p>
                 Track pending and recovered payments.
               </p>
@@ -652,6 +821,7 @@ function App() {
           <div className="section-heading">
             <div>
               <h2>Receivables</h2>
+
               <p>
                 Execute recommended collection actions
                 and record promises to pay.
@@ -766,6 +936,7 @@ function App() {
           <div className="section-heading">
             <div>
               <h2>Audit log</h2>
+
               <p>
                 Payment and receivables actions are shown
                 together from both CSV files.
@@ -817,6 +988,7 @@ function App() {
                       <td>
                         {record.company ||
                           record.customer_name ||
+                          record.customer ||
                           "-"}
                       </td>
 

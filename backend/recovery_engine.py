@@ -1,3 +1,5 @@
+import os
+import shutil
 import csv
 from pathlib import Path
 
@@ -228,10 +230,87 @@ def update_payment_status(payment_id, new_status):
     raise ValueError(
         f"Payment {payment_id} was not found"
     )
+def sync_payment_link_status(
+    payment_id,
+    razorpay_status,
+):
+    """
+    Update a local payment using its payment_id
+    after checking the Razorpay Payment Link status.
+    """
 
+    status = str(
+        razorpay_status or ""
+    ).strip().lower()
 
+    if status in {
+        "paid",
+        "captured",
+        "success",
+        "successful",
+    }:
+        new_status = "recovered"
+        recovery_status = "recovered"
+
+    elif status in {
+        "expired",
+        "cancelled",
+        "canceled",
+    }:
+        new_status = "failed"
+        recovery_status = "pending"
+
+    else:
+        new_status = "pending"
+        recovery_status = "pending"
+
+    payments = load_payments()
+    updated_payment = None
+
+    for payment in payments:
+        current_payment_id = str(
+            payment.get("payment_id")
+            or payment.get("id")
+            or ""
+        ).strip()
+
+        if current_payment_id == str(
+            payment_id
+        ).strip():
+
+            payment["status"] = new_status
+            payment["recovery_status"] = recovery_status
+
+            if new_status == "recovered":
+                payment["failure_reason"] = ""
+
+            updated_payment = payment
+            break
+
+    if updated_payment is None:
+        raise ValueError(
+            f"Payment {payment_id} was not found in payments.csv"
+        )
+
+    save_payments(payments)
+
+    return {
+        "payment_id": updated_payment.get(
+            "payment_id",
+            "",
+        ),
+        "status": new_status,
+        "recovery_status": recovery_status,
+    }
 def reset_payments():
-    """
-    Reload the current payment records.
-    """
+    backup_file = "data/payments_demo_backup.csv"
+
+    if not os.path.exists(backup_file):
+        raise FileNotFoundError(
+            f"Demo backup file not found: {backup_file}"
+        )
+
+    shutil.copyfile(backup_file, PAYMENTS_FILE)
+
+    return load_payments()
     return load_payments()

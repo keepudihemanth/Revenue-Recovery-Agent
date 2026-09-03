@@ -3,10 +3,11 @@ import traceback
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+from razorpay_service import get_payment_link_status
 from recovery_engine import (
     load_payments,
     analyze_payment,
-    update_payment_status,
+    sync_payment_link_status,
     reset_payments,
 )
 
@@ -29,6 +30,7 @@ from receivables_audit import load_receivables_audit
 
 
 app = Flask(__name__)
+
 
 CORS(
     app,
@@ -56,7 +58,29 @@ def json_error(message, status_code=400):
     }), status_code
 
 
+def get_latest_audit_for_payment(payment_id):
+    """
+    Return the latest audit record for a payment.
+    """
+    records = load_audit_records()
+
+    matching_records = [
+        record
+        for record in records
+        if str(record.get("payment_id", "")).strip()
+        == str(payment_id).strip()
+    ]
+
+    if not matching_records:
+        return None
+
+    return matching_records[-1]
+
+
 def get_analyzed_payments():
+    """
+    Load payments and apply the latest audit status.
+    """
     payments = load_payments()
     analyzed_payments = []
 
@@ -67,7 +91,6 @@ def get_analyzed_payments():
             payment.get("payment_id", "")
         ).strip()
 
-        # Read the latest audit status for this payment.
         audit_record = get_latest_audit_for_payment(
             payment_id
         )
@@ -84,12 +107,18 @@ def get_analyzed_payments():
             elif audit_status == "failed":
                 analyzed_payment["recovery_status"] = "failed"
 
+            elif audit_status == "pending":
+                analyzed_payment["recovery_status"] = "pending"
+
         analyzed_payments.append(analyzed_payment)
 
     return analyzed_payments
 
 
 def find_payment(payment_id):
+    """
+    Find one analyzed payment by payment_id.
+    """
     payments = get_analyzed_payments()
 
     return next(
@@ -105,8 +134,7 @@ def find_payment(payment_id):
 
 def get_razorpay_service():
     """
-    Import Razorpay only when a Razorpay operation is requested.
-    This allows health and data endpoints to work without credentials.
+    Import Razorpay operations only when required.
     """
     from razorpay_service import (
         create_payment_link,
@@ -114,22 +142,6 @@ def get_razorpay_service():
     )
 
     return create_payment_link, get_payment_link_status
-
-
-def get_latest_audit_for_payment(payment_id):
-    records = load_audit_records()
-
-    matching_records = [
-        record
-        for record in records
-        if str(record.get("payment_id", "")).strip()
-        == str(payment_id).strip()
-    ]
-
-    if not matching_records:
-        return None
-
-    return matching_records[-1]
 
 
 # =========================================================
@@ -185,9 +197,11 @@ def recovery_queue():
                 item["recovery_status"] = (
                     audit_record.get("status", "pending")
                 )
+
             else:
                 item["payment_link_id"] = ""
                 item["payment_link"] = ""
+
                 item["recovery_status"] = (
                     "recovered"
                     if str(
@@ -223,11 +237,12 @@ def recover_payment(payment_id):
     Execute the recommended recovery action.
 
     For create_payment_link:
-        Create a Razorpay link and keep the payment pending.
+        Create a Razorpay payment link and keep the
+        payment pending until it is actually paid.
 
     For other actions:
-        Return the recommended action without falsely marking
-        the payment as recovered.
+        Return the recommended action without falsely
+        marking the payment as recovered.
     """
 
     try:
@@ -252,6 +267,7 @@ def recover_payment(payment_id):
                 create_payment_link, _ = (
                     get_razorpay_service()
                 )
+
             except Exception as error:
                 return jsonify({
                     "success": False,
@@ -343,7 +359,158 @@ def recover_payment(payment_id):
 
 
 # =========================================================
-# Create Razorpay payment link
+# Check Razorpay payment-link status
+# =========================================================
+
+@app.route(
+    "/api/payment-links/<payment_link_id>",
+    methods=["GET"],
+)
+def check_payment_link(payment_link_id):
+    try:
+        _, get_payment_link_status = (
+            get_razorpay_service()
+        )
+
+        result = get_payment_link_status(
+            payment_link_id
+        )
+
+        return jsonify({
+            "success": True,
+            "payment_link": result,
+        }), 200
+
+    except Exception as error:
+        traceback.print_exc()
+
+        return json_error(
+            str(error),
+            500,
+        )
+
+
+# =========================================================
+# Synchronize Razorpay payment-link status
+# =========================================================
+
+@app.route(
+    "/api/payment-links/<payment_link_id>/sync",
+    methods=["POST"],
+)
+def sync_payment_link(payment_link_id):
+    """
+    Fetch the current Razorpay Payment Link status and
+    synchronize the matching local payment and audit records.
+    """
+
+    try:
+        _, get_payment_link_status = (
+            get_razorpay_service()
+        )
+
+        # -------------------------------------------------
+        # 1. Fetch the current status from Razorpay
+        # -------------------------------------------------
+
+        razorpay_data = get_payment_link_status(
+            payment_link_id
+        )
+
+        razorpay_status = str(
+            razorpay_data.get("status", "")
+        ).strip().lower()
+
+        # -------------------------------------------------
+        # 2. Find the local payment_id from audit_log.csv
+        # -------------------------------------------------
+
+        audit_records = load_audit_records()
+        payment_id = None
+
+        for record in audit_records:
+            stored_link_id = str(
+                record.get("payment_link_id") or ""
+            ).strip()
+
+            if stored_link_id == str(
+                payment_link_id
+            ).strip():
+                payment_id = str(
+                    record.get("payment_id") or ""
+                ).strip()
+                break
+
+        if not payment_id:
+            return json_error(
+                "No audit record found for payment link "
+                f"{payment_link_id}",
+                404,
+            )
+
+        # -------------------------------------------------
+        # 3. Update payments.csv using payment_id
+        # -------------------------------------------------
+
+        payment_result = sync_payment_link_status(
+            payment_id=payment_id,
+            razorpay_status=razorpay_status,
+        )
+
+        # -------------------------------------------------
+        # 4. Convert Razorpay status to audit status
+        # -------------------------------------------------
+
+        if razorpay_status in {
+            "paid",
+            "captured",
+            "success",
+            "successful",
+        }:
+            audit_status = "recovered"
+
+        elif razorpay_status in {
+            "failed",
+            "cancelled",
+            "canceled",
+            "expired",
+        }:
+            audit_status = "failed"
+
+        else:
+            audit_status = "pending"
+
+        # -------------------------------------------------
+        # 5. Update audit_log.csv
+        # -------------------------------------------------
+
+        update_audit_status(
+            payment_link_id,
+            audit_status,
+        )
+
+        # -------------------------------------------------
+        # 6. Return synchronized result
+        # -------------------------------------------------
+
+        return jsonify({
+            "success": True,
+            "razorpay_status": razorpay_status,
+            "audit_status": audit_status,
+            "payment": payment_result,
+        }), 200
+
+    except Exception as error:
+        traceback.print_exc()
+
+        return json_error(
+            str(error),
+            500,
+        )
+
+
+# =========================================================
+# Create recovery payment link
 # =========================================================
 
 @app.route(
@@ -362,7 +529,8 @@ def create_recovery_link(payment_id):
 
         if payment.get("action") != "create_payment_link":
             return json_error(
-                f"Payment {payment_id} is not eligible for a payment link",
+                f"Payment {payment_id} is not eligible "
+                "for a payment link",
                 400,
             )
 
@@ -370,6 +538,7 @@ def create_recovery_link(payment_id):
             create_payment_link, _ = (
                 get_razorpay_service()
             )
+
         except Exception as error:
             return jsonify({
                 "success": False,
@@ -443,11 +612,15 @@ def create_recovery_link(payment_id):
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 # =========================================================
-# Razorpay payment-link status
+# Razorpay payment-link status and audit update
 # =========================================================
 
 @app.route(
@@ -479,6 +652,7 @@ def recovery_status(payment_link_id):
         elif razorpay_status in {
             "failed",
             "cancelled",
+            "canceled",
             "expired",
         }:
             audit_status = "failed"
@@ -503,7 +677,11 @@ def recovery_status(payment_link_id):
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 @app.route(
@@ -532,7 +710,11 @@ def audit_history():
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 # =========================================================
@@ -605,7 +787,11 @@ def recovery_summary():
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 # =========================================================
@@ -625,7 +811,11 @@ def reset_demo():
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 # =========================================================
@@ -646,7 +836,11 @@ def receivables_queue():
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 @app.route("/api/receivables/summary", methods=["GET"])
@@ -662,7 +856,11 @@ def receivables_summary():
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 # =========================================================
@@ -689,11 +887,18 @@ def execute_receivable_frontend(invoice_id):
         return execute_receivable(invoice_id)
 
     except ValueError as error:
-        return json_error(str(error), 404)
+        return json_error(
+            str(error),
+            404,
+        )
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 @app.route(
@@ -724,11 +929,18 @@ def promise_to_pay(invoice_id):
         }), 200
 
     except ValueError as error:
-        return json_error(str(error), 404)
+        return json_error(
+            str(error),
+            404,
+        )
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 # =========================================================
@@ -749,7 +961,11 @@ def receivables_audit_history():
 
     except Exception as error:
         traceback.print_exc()
-        return json_error(str(error), 500)
+
+        return json_error(
+            str(error),
+            500,
+        )
 
 
 # =========================================================
@@ -758,12 +974,18 @@ def receivables_audit_history():
 
 @app.errorhandler(404)
 def not_found(error):
-    return json_error("Route not found", 404)
+    return json_error(
+        "Route not found",
+        404,
+    )
 
 
 @app.errorhandler(405)
 def method_not_allowed(error):
-    return json_error("HTTP method not allowed", 405)
+    return json_error(
+        "HTTP method not allowed",
+        405,
+    )
 
 
 # =========================================================

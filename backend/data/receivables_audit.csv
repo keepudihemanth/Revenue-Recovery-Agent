@@ -1,1 +1,4 @@
 invoice_id,company,amount,risk_level,recommended_action,executed_action,status,created_at
+INV001,ABC Pvt Ltd,25000.0,low,no_action,record_promise,promise_recorded,2026-09-03T21:41:13.915040
+INV001,ABC Pvt Ltd,25000.0,low,no_action,record_promise,promise_recorded,2026-09-03T21:41:15.039716
+INV001,ABC Pvt Ltd,25000.0,low,no_action,no_action,executed,2026-09-03T21:41:16.815799

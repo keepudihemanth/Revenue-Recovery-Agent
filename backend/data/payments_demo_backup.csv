@@ -3,7 +3,7 @@ pay_001,1500,failed,temporary_failure,0
 pay_002,2500,failed,insufficient_funds,0
 pay_003,1000,recovered,,1
 pay_004,3000,failed,temporary_failure,1
-pay_005,2000,recovered,,0
+pay_005,2000,failed,checkout_abandoned,0
 pay_006,5000,recovered,,1
 pay_007,1200,failed,temporary_failure,0
 pay_008,1800,failed,insufficient_funds,0
